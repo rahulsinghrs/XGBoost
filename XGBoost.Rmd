@@ -1,0 +1,228 @@
+---
+title: "XGBoost"
+author: "Rahul Singh"
+date: "2/6/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(xgboost) #to load the library
+```
+
+```{r}
+#load dataset
+data("agaricus.train", package='xgboost')
+data("agaricus.test", package='xgboost')
+train<- agaricus.train
+test<- agaricus.test
+#This data set records biological attributes of different mushroom species, and the target is to predict whether it is poisonous.
+#https://www.r-bloggers.com/an-introduction-to-xgboost-r-package/
+```
+
+Each variable is a list containing two things, label and data. The next step is to feed this data to xgboost. Besides the data, we need to train the model with some other parameters:
+(1) nrounds: the number of decision trees in the final model
+(2) objective: the training objective to use, where “binary:logistic” means a binary classifier.
+
+
+```{r}
+str(train)
+```
+
+```{r}
+model <- xgboost(data = train$data, label = train$label,
+                 nrounds = 2, objective = "binary:logistic")
+```
+
+```{r}
+preds = predict(model, test$data)
+```
+
+Sometimes it is important to use cross-validation to exam our model. In xgboost we provide a function xgb.cv to do that. Basically users can just copy every thing from xgboost, and specify nfold
+```{r}
+cv.res <- xgb.cv(data = train$data, label = train$label, nfold = 5,
+                 nrounds = 2, objective = "binary:logistic")
+```
+
+Customized Objective
+
+xgboost can take customized objective. This means the model could be trained to optimize the objective defined by user. This is not often seen in other tools, since most of the algorithms are binded with a specific objective. With xgboost, one can train a model which maximize the work on the correct direction.
+
+Let’s use log-likelihood as an demo. We define the following function to calculate the first and second order of gradient of the loss function:
+```{r}
+loglossobj <- function(preds, dtrain) {
+  # dtrain is the internal format of the training data
+  # We extract the labels from the training data
+  labels <- getinfo(dtrain, "label")
+  # We compute the 1st and 2nd gradient, as grad and hess
+  preds <- 1/(1 + exp(-preds))
+  grad <- preds - labels
+  hess <- preds * (1 - preds)
+  # Return the result as a list
+  return(list(grad = grad, hess = hess))
+}
+```
+
+```{r}
+model <- xgboost(data = train$data, label = train$label,
+                 nrounds = 2, objective = loglossobj, eval_metric = "error")
+
+```
+The result should be equivalent to objective = "binary:logistic"
+
+Early Stopping
+
+A usual scenario is when we are not sure how many trees we need, we will firstly try some numbers and check the result. If the number we try is too small, we need to make it larger; If the number is too large, we are wasting time to wait for the termination. By setting the parameter early_stopping, xgboost will terminate the training process if the performance is getting worse in the iteration.
+```{r}
+#Early Stopping
+bst <- xgb.cv(data = train$data, label = train$label, nfold = 5,nrounds = 20, objective = "binary:logistic", early.stop.round = 3, maximize = FALSE)
+```
+Here we are doing cross validation. early.stop.round = 3 means if the performance is not getting better for 3 steps, then the program will stop. maximize = FALSE means our goal is not to maximize the evaluation, where the default evaluation metric for binary classification is the classification error rate. We can see that even we ask the model to train 20 trees, it stopped after the performance is perfect.
+
+####Continue Training
+
+Sometimes we might want to try to do 1000 iterations and check the result, then decide if we need another 1000 ones. Usually the second step could only be done by starting from the beginning, again. In xgboost users can continue the training on the previous model, thus the second step will cost you the time for the additional iterations only. The theoratical reason that we are capable to do this is because each tree is only trained based the prediction result of the previous trees. Once we get the prediction by the current trees, we can start to train the next one.
+
+This feature involves with the internal data format of xgboost: xgb.DMatrix. An xgb.DMatrix object contains the features, target and other side informations, e.g. weights, missing values.
+
+First, let us define an xgb.DMatrix object for this data:
+```{r}
+dtrain <- xgb.DMatrix(train$data, label = train$label)
+```
+
+```{r}
+#train the model
+model <- xgboost(data = dtrain, nrounds = 2, objective ="binary:logistic")
+```
+
+Note that we have the label included in the dtrain object. Then we make prediction on the current training data:
+```{r}
+pred_train <- predict(model, dtrain, outputmargin=TRUE)
+```
+
+Here the parameter outputmargin indicates that we don’t need a logistic transformation of the result.
+
+Finally we put the previous prediction result as an additional information to the object dtrain, so that the training algorithm knows where to start.
+
+```{r}
+setinfo(dtrain, "base_margin", pred_train)
+```
+
+Now observe how is the result changed:
+```{r}
+model <- xgboost(data = dtrain, nrounds = 2, objective = "binary:logistic")
+```
+
+####Handle Missing Values
+
+Missing value is commonly seen in real-world data sets. Handling missing values has no rule to apply to all cases, since there could be various reasons for the values to be missing. In xgboost we choose a soft way to handle missing values. When using a feature with missing values to do splitting, xgboost will assign a direction to the missing values instead of a numerical value. Specifically, xgboost guides all the data points with missing values to the left and right respectively, then choose the direction with a higher gain with regard to the objective.
+
+To enable this feature, simply set the parameter missing to mark the missing value label. To demonstrate it, we can manually make a dataset with missing values.
+
+```{r}
+dat <- matrix(rnorm(128), 64, 2)
+label <- sample(0:1, nrow(dat), replace = TRUE)
+for (i in 1:nrow(dat)) {
+  ind <- sample(2, 1)
+  dat[i, ind] <- NA
+}
+```
+
+```{r}
+model <- xgboost(data = dat, label = label, missing = NA, nrounds = 2, objective = "binary:logistic")
+```
+
+Practically, the default value of missing is exactly NA, therefore we don’t even need to specify it in a standard case.
+
+####Model Inspection
+The model used by xgboost is gradient boosting trees, therefore a model usually contains multiple tree models. A typical ensemble of two trees looks like this:
+
+```{r}
+bst <- xgboost(data = train$data, label = train$label, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "binary:logistic")
+```
+
+```{r}
+library(DiagrammeR)
+xgb.plot.tree(feature_names = agaricus.train$data@Dimnames[[2]], model = bst)
+```
+
+We can make an interpretation on the model easily. xgboost provides a function xgb.plot.tree to plot the model so that we can have a direct impression on the result.
+
+However, what if we have way more trees?
+
+```{r}
+bst <- xgboost(data = train$data, label = train$label, max.depth = 2,
+               eta = 1, nthread = 2, nround = 10, objective = "binary:logistic")
+xgb.plot.tree(feature_names = agaricus.train$data@Dimnames[[2]], model = bst)
+
+```
+
+It is starting to make things messy. We even have a hard time to inspect every detail on the plot. It is not easy to tell a story with too many conditions.
+
+####Multiple-in-one plot
+
+In xgboost,there is a function xgb.plot.multi.trees to ensemble several trees into a single one!
+
+Almost all the trees in an ensemble model have the same shape. If the maximum depth is determined, this holds for all the binary trees.
+
+On each node there would be more than one feature that have appeared on this position. But we can describe it by the frequency of each feature thus make a frequenct table.
+
+Here is an example of an “ensembled” tree visualization.
+
+```{r}
+bst <- xgboost(data = train$data, label = train$label, max.depth = 15,
+                 eta = 1, nthread = 2, nround = 30, objective = "binary:logistic",
+                 min_child_weight = 50)
+xgb.plot.multi.trees(model = bst, feature_names = agaricus.train$data@Dimnames[[2]], features.keep = 3)
+```
+
+The text in the nodes indicates the distribution of the features selected at this position. If we hover our mouse on the nodes, we get hte information of the path.
+
+####Feature Importance
+
+If the tree is too deep, or the number of features is large, then it is still gonna be difficult to find any useful patterns. One simplified way is to check feature importance instead. How do we define feature importance in xgboost?
+
+In xgboost, each split tries to find the best feature and splitting point to optimize the objective. We can calculate the gain on each node, and it is the contribution from the selected feature. In the end we look into all the trees, and sum up all the contribution for each feature and treat it as the importance. If the number of features is large, we can also do a clustering on features before we make the plot. Here’s an example of the feature importance plot from the function xgb.plot.importance:
+
+
+```{r}
+bst <- xgboost(data = train$data, label = train$label, max.depth = 2,
+               eta = 1, nthread = 2, nround = 2,objective = "binary:logistic")
+importance_matrix <- xgb.importance(agaricus.train$data@Dimnames[[2]], model = bst)
+xgb.plot.importance(importance_matrix)
+
+```
+
+####Deepness
+
+There is more than one way to understand the structure of the trees, besides plotting them all. Since there are all binary trees, we can have a clear figure in mind if we get to know the depth of each leaf.
+
+From the function xgb.plot.deepness, we can get two plots summarizing the distribution of leaves according to the change of depth in the tree.
+
+```{r}
+bst <- xgboost(data = train$data, label = train$label, max.depth = 15,
+                 eta = 1, nthread = 2, nround = 30, objective = "binary:logistic",
+                 min_child_weight = 50)
+xgb.plot.deepness(model = bst)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
